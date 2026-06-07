@@ -1,0 +1,971 @@
+---
+title: "Bayesian Statistics - Project"
+output: html_notebook
+---
+
+
+
+```{r warning=FALSE, message=FALSE}
+setwd("~/Semester 10/Bayes/Project")
+
+library(tidyverse)
+library(rstan)
+library(ggimage)
+library(bayesplot)
+library(loo)
+library(patchwork)
+
+data <- readRDS("penguins.RDS")
+
+```
+
+# EDA
+
+```{r warning=FALSE, message=FALSE}
+
+data %>%
+  summarise(mean_bl = mean(bill_length), sd_bl = sd(bill_length),
+            min = min(bill_length), max = max(bill_length),
+             n = n())
+data %>%
+  group_by(species) %>%
+  summarise(mean_bl = mean(bill_length), sd_bl = sd(bill_length),
+             min = min(bill_length), max = max(bill_length),
+             n = n())
+
+
+data %>%
+  group_by(species, sex) %>%
+  summarise(mean_bl = mean(bill_length), sd_bl = sd(bill_length),
+             min = min(bill_length), max = max(bill_length),
+            n = n())
+
+```
+
+
+```{r}
+
+ggplot(data, aes(x=bill_length,fill=sex)) +
+  geom_histogram(alpha=0.5,position = "identity") +
+  facet_wrap(~ species, scales = "fixed") +   
+  labs(title = "Distribution of Penguin Bill Length by Species",
+       x = "Bill Length", y = "Count",fill="Sex") +
+  theme_classic() +
+  theme(strip.text = element_text(face = "bold", size = 12)) 
+
+```
+
+```{r}
+
+
+h <- hist(data$bill_length,breaks = 40,plot = FALSE)
+
+img_data <- map2_df(
+  seq_along(h$counts),h$counts,\(i, n) {
+    tibble(x = h$mids[i],y = seq_len(n))
+  })
+
+img_data$image <- "~/Semester 10/Bayes/Project/penguin.png"
+
+ggplot(img_data, aes(x, y)) +
+  geom_bar(data=data.frame(h$counts,h$mids),aes(x=h.mids,y=h.counts),inherit.aes = FALSE,stat="identity") +
+  geom_image(aes(image = image, y = y - 0.5),size = 0.04) +
+  labs(title = "Distribution of Penguin Bill Length",x = "Bill Length",y = "Count") +
+  theme_classic()
+
+```
+
+
+```{r}
+
+h_list <- data %>%
+  group_by(species) %>%
+  group_map(~ {
+    h <- hist(.x$bill_length, breaks = 15, plot = FALSE)
+    map2_df(
+      seq_along(h$counts), h$counts, \(i, n) {
+        tibble(x = h$mids[i], y = seq_len(n))
+      }) %>%
+      mutate(species = .y$species)
+  }) %>%
+  bind_rows()
+
+# Add species-specific images
+h_list <- h_list %>%
+  mutate(image = case_when(
+    species == "Adelie"    ~ "~/Semester 10/Bayes/Project/penguin_red.png",
+    species == "Chinstrap" ~ "~/Semester 10/Bayes/Project/penguin_blue.png",
+    species == "Gentoo"    ~ "~/Semester 10/Bayes/Project/penguin_yellow.png"
+  ))
+
+# Bar data per species
+bar_list <- data %>%
+  group_by(species) %>%
+  group_map(~ {
+    h <- hist(.x$bill_length, breaks = 15, plot = FALSE)
+    tibble(mids = h$mids, counts = h$counts, species = .y$species)
+  }) %>%
+  bind_rows()
+
+ggplot(h_list, aes(x, y)) +
+  geom_bar(data = bar_list, aes(x = mids, y = counts),
+           inherit.aes = FALSE, stat = "identity", fill = "grey80", color = "grey60") +
+  geom_image(aes(image = image, y = y - 0.5), size = 0.035) +
+  facet_wrap(~ species, scales = "fixed") + 
+  labs(title = "Distribution of Penguin Bill Length by Species",
+       x = "Bill Length", y = "Count") +
+  theme_classic() +
+  theme(strip.text = element_text(face = "bold", size = 12))
+
+```
+
+
+```{r}
+
+data$image <- case_when(
+  data$species == "Adelie" ~ "~/Semester 10/Bayes/Project/penguin_red.png",
+  data$species == "Chinstrap" ~ "~/Semester 10/Bayes/Project/penguin_blue.png",
+  data$species == "Gentoo" ~ "~/Semester 10/Bayes/Project/penguin_yellow.png"
+)
+
+ggplot(data, aes(x = bill_depth, y = bill_length)) +
+  geom_point(aes(color = species, shape = sex),alpha = 0,size = 6) +
+  scale_color_manual(values = c(Adelie = "red4",Chinstrap = "blue4",Gentoo = "gold3")) +
+  guides(color = guide_legend(override.aes = list(alpha = 0.8, size = 5))) +
+  geom_point(aes(shape = sex),size = 6) +
+  geom_image(aes(image=image),alpha = 0.7, size = 0.03) +
+  labs(title = "Bill Length vs. Bill Depth",x="Bill Depth",y="Bill Length",shape="Sex",color="Species") +
+  theme_classic()
+```
+
+
+
+# Models
+
+Use the values of the fitted lm for the priors.
+
+```{r}
+
+summary(lm(bill_length~bill_depth+sex+species,data))
+summary(lm(bill_length~bill_depth+sex,data[data$species=="Adelie",]))
+summary(lm(bill_length~bill_depth+sex,data[data$species=="Chinstrap",]))
+summary(lm(bill_length~bill_depth+sex,data[data$species=="Gentoo",]))
+
+```
+
+
+
+```{r}
+data$sex_num <- ifelse(data$sex == "male", 1, 0)
+data$species_num <- as.integer(data$species)
+
+stan_data <- list(
+  N          = nrow(data),
+  K          = 3,
+  species    = data$species_num,
+  bill_depth = data$bill_depth,
+  bill_depth2 = data$bill_depth^2,
+  sex        = data$sex_num,
+  bill_length = data$bill_length,
+  log_bill_length = log(data$bill_length)
+)
+
+```
+
+# Seperate Model
+
+For the seperate model types I compare two models. One is a normal model and one a student-t model.
+
+Weakly informative but empirical motivated priors are being used.
+
+## 3 species - normal
+
+Priors:
+alpha ~ normal(28,10);
+beta_depth ~ normal(0.5,1);
+beta_sex ~ normal(3,1);
+sigma ~ normal(0,5);
+
+
+
+```{r}
+
+model_code <- "
+data {
+  int<lower=0> N;
+  int<lower=1> K;
+  array[N] int<lower=1, upper=K> species;
+  vector[N] bill_depth;
+  array[N] int<lower=0, upper=1> sex;
+  vector[N] bill_length;
+}
+
+parameters {
+  vector[K] alpha;
+  vector[K] beta_depth;
+  vector[K] beta_sex;
+  vector<lower=0>[K] sigma;
+}
+
+model {
+  alpha ~ normal(28,10);
+  beta_depth ~ normal(0.5,1);
+  beta_sex   ~ normal(3,1);
+  sigma ~ normal(0,5);
+
+  for (n in 1:N) {
+    int k = species[n];
+
+    bill_length[n] ~ normal(
+      alpha[k] + beta_depth[k] * bill_depth[n] + beta_sex[k] * sex[n],
+      sigma[k]
+    );
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_rep;
+
+  for (n in 1:N) {
+    int k = species[n];
+
+    real mu_n =
+      alpha[k] + beta_depth[k] * bill_depth[n] + beta_sex[k] * sex[n];
+
+    log_lik[n] =
+      normal_lpdf(bill_length[n] | mu_n, sigma[k]);
+
+    y_rep[n] =
+      normal_rng(mu_n, sigma[k]);
+  }
+}"
+
+sepN <- stan(model_code=model_code,data=stan_data,
+             chains=4,iter=7000,seed=984232)
+```
+
+
+
+## 3 species - t
+
+Priors:
+alpha ~ normal(28,10);
+beta_depth ~ normal(0.5,1);
+beta_sex ~ normal(3,1);
+sigma ~ normal(0,5);
+
+nu ~ gamma(2,0.1);
+
+
+```{r}
+
+model_code <- "
+data {
+  int<lower=0> N;
+  int<lower=1> K; 
+  array[N] int<lower=1, upper=K> species;
+  vector[N] bill_depth;
+  array[N] int<lower=0, upper=1> sex;
+  vector[N] bill_length;
+}
+
+parameters {
+  vector[K] alpha;
+  vector[K] beta_depth;
+  vector[K] beta_sex;
+  vector<lower=0>[K] sigma;
+  real<lower=2> nu;   
+}
+
+model {
+  alpha ~ normal(28,10);
+  beta_depth ~ normal(0.5,1);
+  beta_sex   ~ normal(3,1);
+  sigma ~ normal(0,5);
+  nu ~ gamma(2,0.1);
+  
+  for (n in 1:N) {
+    int k = species[n];
+    bill_length[n] ~ student_t(
+      nu,
+      alpha[k] + beta_depth[k] * bill_depth[n] + beta_sex[k] * sex[n],
+      sigma[k]
+    );
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_rep;
+  for (n in 1:N) {
+    int k = species[n];
+    real mu_n = alpha[k]
+              + beta_depth[k] * bill_depth[n] + beta_sex[k] * sex[n];
+              
+    log_lik[n] = student_t_lpdf(bill_length[n] | nu, mu_n, sigma[k]);
+    y_rep[n]   = student_t_rng(nu, mu_n, sigma[k]);
+  }
+}"
+
+
+sepT <- stan(model_code=model_code,data=stan_data,
+             chains=4,iter=7000,seed=984232)
+```
+
+## Compare those two models
+
+```{r}
+list_of_draws <- rstan::extract(sepN)
+y_pred <- list_of_draws$y_rep
+
+p1 <- ppc_dens_overlay(data$bill_length, y_pred[1:200,]) + labs(title="Empirical and simulated kernel density")
+p2 <- ppc_ecdf_overlay(data$bill_length, y_pred[1:200,]) + labs(title="Empirical and simulated CDF")
+p3 <- ppc_stat_2d(stan_data$bill_length, y_pred, stat=c("min","max")) + labs(title="Empirical and simulated minimum and maximum values")
+(p1+p2)/p3
+
+list_of_draws <- rstan::extract(sepT)
+y_pred <- list_of_draws$y_rep
+
+
+p1 <- ppc_dens_overlay(data$bill_length, y_pred[1:200,]) + labs(title="Empirical and simulated kernel density")
+p2 <- ppc_ecdf_overlay(data$bill_length, y_pred[1:200,]) + labs(title="Empirical and simulated CDF")
+p3 <- ppc_stat_2d(stan_data$bill_length, y_pred, stat=c("min","max")) + labs(title="Empirical and simulated minimum and maximum values")
+(p1+p2)/p3
+
+```
+
+
+# Hierarchical Model
+
+Because for the seperate case, the student t model was a better fit. A hierarchical student t model is the next step.
+
+Priors: 
+mu_alpha ~ normal(28,5);
+mu_depth ~ normal(0.5,1);
+mu_sex ~ normal(3,1);
+
+tau_alpha ~ exponential(1);
+tau_depth ~ exponential(1);
+tau_sex ~ exponential(1);
+
+sigma ~ exponential(1);
+
+nu ~ gamma(2,0.1);
+
+```{r}
+
+
+model_code <- "data {
+  int<lower=0> N;
+  int<lower=1> K;
+
+  array[N] int<lower=1, upper=K> species;
+  array[N] int<lower=0, upper=1> sex;
+
+  vector[N] bill_depth;
+  vector[N] bill_length;
+}
+
+parameters {
+
+  // group-level parameters
+  real mu_alpha;
+  real mu_depth;
+  real mu_sex;
+
+  real<lower=0> tau_alpha;
+  real<lower=0> tau_depth;
+  real<lower=0> tau_sex;
+
+  // species-level parameters
+  vector[K] alpha;
+  vector[K] beta_depth;
+  vector[K] beta_sex;
+
+  vector<lower=0>[K] sigma;
+
+  real<lower=2> nu;
+}
+
+model {
+
+  // hyperpriors
+  mu_alpha ~ normal(28, 5);
+  mu_depth ~ normal(0.5, 1);
+  mu_sex   ~ normal(3, 1);
+
+  tau_alpha ~ exponential(1);
+  tau_depth ~ exponential(1);
+  tau_sex   ~ exponential(1);
+
+  // hierarchical priors
+  alpha ~ normal(mu_alpha, tau_alpha);
+  beta_depth ~ normal(mu_depth, tau_depth);
+  beta_sex ~ normal(mu_sex, tau_sex);
+
+  sigma ~ exponential(1);
+
+  nu ~ gamma(2, 0.1);
+
+  // likelihood
+  for (n in 1:N) {
+
+    int k = species[n];
+
+    bill_length[n] ~ student_t(
+      nu,
+      alpha[k]
+      + beta_depth[k] * bill_depth[n]
+      + beta_sex[k] * sex[n],
+      sigma[k]
+    );
+  }
+}
+
+generated quantities {
+
+  vector[N] log_lik;
+  vector[N] y_rep;
+
+  for (n in 1:N) {
+
+    int k = species[n];
+
+    real mu_n =
+      alpha[k]
+      + beta_depth[k] * bill_depth[n]
+      + beta_sex[k] * sex[n];
+
+    log_lik[n] =
+      student_t_lpdf(
+        bill_length[n] |
+        nu,
+        mu_n,
+        sigma[k]
+      );
+
+    y_rep[n] =
+      student_t_rng(
+        nu,
+        mu_n,
+        sigma[k]
+      );
+  }
+} "
+
+
+
+hierT <- stan(model_code=model_code,data=stan_data,
+             chains=4,iter=10000,seed=984232)
+```
+
+
+```{r}
+list_of_draws <- rstan::extract(hierT)
+y_pred <- list_of_draws$y_rep
+
+
+p1 <- ppc_dens_overlay(data$bill_length, y_pred[1:200,]) + labs(title="Empirical and simulated kernel density")
+p2 <- ppc_ecdf_overlay(data$bill_length, y_pred[1:200,]) + labs(title="Empirical and simulated CDF")
+p3 <- ppc_stat_2d(stan_data$bill_length, y_pred, stat=c("min","max")) + labs(title="Empirical and simulated minimum and maximum values")
+(p1+p2)/p3
+```
+
+
+
+# Convergence Checks
+
+
+```{r}
+
+p1 <- mcmc_rhat_hist(bayesplot::rhat(sepN))+labs(title="Seperate Model - Normal")
+p2 <- mcmc_rhat_hist(bayesplot::rhat(sepT))+labs(title="Seperate Model - Student t")
+p3 <- mcmc_rhat_hist(bayesplot::rhat(hierT))+labs(title="Hierarchical Model")
+
+rhat_1 <- bayesplot::rhat(sepN)[1:12]
+mcmc_rhat(rhat_1)+yaxis_text(hjust=0)
+rhat_2 <- bayesplot::rhat(sepT)[1:13]
+mcmc_rhat(rhat_2)+yaxis_text(hjust=0)
+rhat_3 <- bayesplot::rhat(hierT)[1:19]
+mcmc_rhat(rhat_3)+yaxis_text(hjust=0)
+
+```
+
+
+```{r}
+p1 <- traceplot(sepN,names(rhat_1))+labs(title="Seperate Model - Normal")
+p2 <- traceplot(sepT,names(rhat_2))+labs(title="Seperate Model - Student t")
+p3 <- traceplot(hierT,names(rhat_3))+labs(title="Hierarchical Model")
+
+(p1+p2)/p3
+
+```
+
+
+```{r}
+p1 <- mcmc_neff_hist(neff_ratio(sepN))+labs(title="Seperate Model - Normal")
+p2 <- mcmc_neff_hist(neff_ratio(sepT))+labs(title="Seperate Model - Student t")
+p3 <- mcmc_neff_hist(neff_ratio(hierT))+labs(title="Hierarchical Model")
+
+(p1+p2)/p3
+```
+
+```{r}
+check_hmc_diagnostics(sepN)
+check_hmc_diagnostics(sepT)
+check_hmc_diagnostics(hierT)
+```
+
+
+
+# Model comparison
+
+## PSIS-LOO
+
+```{r}
+
+
+(loo_normal <- loo(extract_log_lik(sepN)))
+(loo_t      <- loo(extract_log_lik(sepT)))
+(loo_hier  <- loo(extract_log_lik(hierT)))
+
+loo_compare(loo_normal, loo_t, loo_hier)
+```
+
+## WAIC
+
+```{r}
+
+waic(extract_log_lik(sepN))
+waic(extract_log_lik(sepT))
+waic(extract_log_lik(hierT))
+
+
+```
+
+# Prior Sensitivity Analysis
+
+## 3 species - normal
+
+Weaker priors are chosen to compare the estimates
+
+Priors:
+alpha ~ normal(28,20);
+beta_depth ~ normal(0,3);
+beta_sex ~ normal(0,5);
+sigma ~ normal(0,10);
+
+
+
+```{r}
+
+model_code <- "
+data {
+  int<lower=0> N;
+  int<lower=1> K;
+  array[N] int<lower=1, upper=K> species;
+  vector[N] bill_depth;
+  array[N] int<lower=0, upper=1> sex;
+  vector[N] bill_length;
+}
+
+parameters {
+  vector[K] alpha;
+  vector[K] beta_depth;
+  vector[K] beta_sex;
+  vector<lower=0>[K] sigma;
+}
+
+
+model {
+  alpha ~ normal(28,20);
+  beta_depth ~ normal(0,3);
+  beta_sex   ~ normal(0,5);
+  sigma ~ normal(0,10);
+
+  for (n in 1:N) {
+    int k = species[n];
+
+    bill_length[n] ~ normal(
+      alpha[k] + beta_depth[k] * bill_depth[n] + beta_sex[k] * sex[n],
+      sigma[k]
+    );
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_rep;
+
+  for (n in 1:N) {
+    int k = species[n];
+
+    real mu_n =
+      alpha[k] + beta_depth[k] * bill_depth[n] + beta_sex[k] * sex[n];
+
+    log_lik[n] =
+      normal_lpdf(bill_length[n] | mu_n, sigma[k]);
+
+    y_rep[n] =
+      normal_rng(mu_n, sigma[k]);
+  }
+}"
+
+sepN_SA <- stan(model_code=model_code,data=stan_data,
+             chains=4,iter=7000,seed=984232)
+```
+
+```{r}
+d1 <- mcmc_intervals_data(
+  as.array(sepN),
+  pars = c(
+    "alpha[1]","alpha[2]","alpha[3]",
+    "beta_depth[1]","beta_depth[2]","beta_depth[3]",
+    "beta_sex[1]","beta_sex[2]","beta_sex[3]"
+  )
+)
+
+d1$model <- "Original"
+
+d2 <- mcmc_intervals_data(
+  as.array(sepN_SA),
+  pars = c(
+    "alpha[1]","alpha[2]","alpha[3]",
+    "beta_depth[1]","beta_depth[2]","beta_depth[3]",
+    "beta_sex[1]","beta_sex[2]","beta_sex[3]"
+  )
+)
+
+d2$model <- "Weak"
+
+d <- bind_rows(d1, d2)
+
+ggplot(d, aes(y = parameter, x = m, color = model)) +
+  geom_errorbarh(aes(xmin = ll, xmax = hh),
+                 height = 0,
+                 position = position_dodge(width = 0.6)) +
+  geom_errorbarh(aes(xmin = l, xmax = h),
+                 size = 1.2,
+                 height = 0,
+                 position = position_dodge(width = 0.6)) +
+  geom_point(position = position_dodge(width = 0.6),
+             size = 2) +
+  labs(
+    x = "Posterior estimate",
+    y = NULL,
+    color = "Model",
+    title = "Separate Gaussian"
+  ) +
+  theme_minimal()
+```
+
+
+## 3 species - t
+
+Priors:
+alpha ~ normal(28,20);
+beta_depth ~ normal(0,3);
+beta_sex ~ normal(0,5);
+
+sigma ~ normal(0,10);
+
+nu ~ gamma(2,0.05);
+
+```{r}
+
+model_code <- "
+data {
+  int<lower=0> N;
+  int<lower=1> K; 
+  array[N] int<lower=1, upper=K> species;
+  vector[N] bill_depth;
+  array[N] int<lower=0, upper=1> sex;
+  vector[N] bill_length;
+}
+
+parameters {
+  vector[K] alpha;
+  vector[K] beta_depth;
+  vector[K] beta_sex;
+  vector<lower=0>[K] sigma;
+  real<lower=2> nu;   
+}
+
+model {
+  alpha ~ normal(28,20);
+  beta_depth ~ normal(0,3);
+  beta_sex   ~ normal(0,5);
+  sigma ~ normal(0,10);
+  nu ~ gamma(2,0.05);
+  
+  for (n in 1:N) {
+    int k = species[n];
+    bill_length[n] ~ student_t(
+      nu,
+      alpha[k] + beta_depth[k] * bill_depth[n] + beta_sex[k] * sex[n],
+      sigma[k]
+    );
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_rep;
+  for (n in 1:N) {
+    int k = species[n];
+    real mu_n = alpha[k]
+              + beta_depth[k] * bill_depth[n] + beta_sex[k] * sex[n];
+              
+    log_lik[n] = student_t_lpdf(bill_length[n] | nu, mu_n, sigma[k]);
+    y_rep[n]   = student_t_rng(nu, mu_n, sigma[k]);
+  }
+}"
+
+
+sepT_SA <- stan(model_code=model_code,data=stan_data,
+             chains=4,iter=7000,seed=984232)
+```
+
+```{r}
+d1 <- mcmc_intervals_data(
+  as.array(sepT),
+  pars = c(
+    "alpha[1]","alpha[2]","alpha[3]",
+    "beta_depth[1]","beta_depth[2]","beta_depth[3]",
+    "beta_sex[1]","beta_sex[2]","beta_sex[3]"
+  )
+)
+
+d1$model <- "Original"
+
+d2 <- mcmc_intervals_data(
+  as.array(sepT_SA),
+  pars = c(
+    "alpha[1]","alpha[2]","alpha[3]",
+    "beta_depth[1]","beta_depth[2]","beta_depth[3]",
+    "beta_sex[1]","beta_sex[2]","beta_sex[3]"
+  )
+)
+
+d2$model <- "Weak"
+
+d <- bind_rows(d1, d2)
+
+ggplot(d, aes(y = parameter, x = m, color = model)) +
+  geom_errorbarh(aes(xmin = ll, xmax = hh),
+                 height = 0,
+                 position = position_dodge(width = 0.6)) +
+  geom_errorbarh(aes(xmin = l, xmax = h),
+                 size = 1.2,
+                 height = 0,
+                 position = position_dodge(width = 0.6)) +
+  geom_point(position = position_dodge(width = 0.6),
+             size = 2) +
+  labs(
+    x = "Posterior estimate",
+    y = NULL,
+    color = "Model",
+    title = "Separate Student-t"
+  ) +
+  theme_minimal()
+
+```
+
+
+## Hierarchical Model
+
+Priors:
+
+mu_alpha ~ normal(28, 10)
+mu_depth ~ normal(0, 3)
+mu_sex   ~ normal(0, 5)
+
+tau_alpha ~ exponential(0.5)
+tau_depth ~ exponential(0.5)
+tau_sex   ~ exponential(0.5)
+
+sigma ~ exponential(0.5)
+
+nu ~ gamma(2, 0.05)
+
+```{r}
+
+
+model_code <- "data {
+  int<lower=0> N;
+  int<lower=1> K;
+
+  array[N] int<lower=1, upper=K> species;
+  array[N] int<lower=0, upper=1> sex;
+
+  vector[N] bill_depth;
+  vector[N] bill_length;
+}
+
+parameters {
+
+  // group-level parameters
+  real mu_alpha;
+  real mu_depth;
+  real mu_sex;
+
+  real<lower=0> tau_alpha;
+  real<lower=0> tau_depth;
+  real<lower=0> tau_sex;
+
+  // species-level parameters
+  vector[K] alpha;
+  vector[K] beta_depth;
+  vector[K] beta_sex;
+
+  vector<lower=0>[K] sigma;
+
+  real<lower=2> nu;
+}
+
+model {
+
+  // hyperpriors
+  mu_alpha ~ normal(28, 10);
+  mu_depth ~ normal(0, 3);
+  mu_sex   ~ normal(0, 5);
+
+  tau_alpha ~ exponential(0.5);
+  tau_depth ~ exponential(0.5);
+  tau_sex   ~ exponential(0.5);
+
+  // hierarchical priors
+  alpha ~ normal(mu_alpha, tau_alpha);
+  beta_depth ~ normal(mu_depth, tau_depth);
+  beta_sex ~ normal(mu_sex, tau_sex);
+
+  sigma ~ exponential(0.5);
+
+  nu ~ gamma(2, 0.05);
+
+  // likelihood
+  for (n in 1:N) {
+
+    int k = species[n];
+
+    bill_length[n] ~ student_t(
+      nu,
+      alpha[k]
+      + beta_depth[k] * bill_depth[n]
+      + beta_sex[k] * sex[n],
+      sigma[k]
+    );
+  }
+}
+
+generated quantities {
+
+  vector[N] log_lik;
+  vector[N] y_rep;
+
+  for (n in 1:N) {
+
+    int k = species[n];
+
+    real mu_n =
+      alpha[k]
+      + beta_depth[k] * bill_depth[n]
+      + beta_sex[k] * sex[n];
+
+    log_lik[n] =
+      student_t_lpdf(
+        bill_length[n] |
+        nu,
+        mu_n,
+        sigma[k]
+      );
+
+    y_rep[n] =
+      student_t_rng(
+        nu,
+        mu_n,
+        sigma[k]
+      );
+  }
+} "
+
+
+
+hierT_SA <- stan(model_code=model_code,data=stan_data,
+             chains=4,iter=10000,seed=984232)
+```
+
+
+```{r}
+
+d1 <- mcmc_intervals_data(
+  as.array(hierT),
+  pars = dimnames(as.array(hierT))[[3]][1:19]
+)
+
+d1$model <- "Original"
+
+d2 <- mcmc_intervals_data(
+  as.array(hierT_SA),
+  pars =dimnames(as.array(hierT))[[3]][1:19]
+)
+
+d2$model <- "Weak"
+
+d <- bind_rows(d1, d2)
+
+ggplot(d, aes(y = parameter, x = m, color = model)) +
+  geom_errorbarh(aes(xmin = ll, xmax = hh),
+                 height = 0,
+                 position = position_dodge(width = 0.6)) +
+  geom_errorbarh(aes(xmin = l, xmax = h),
+                 size = 1.2,
+                 height = 0,
+                 position = position_dodge(width = 0.6)) +
+  geom_point(position = position_dodge(width = 0.6),
+             size = 2) +
+  labs(
+    x = "Posterior estimate",
+    y = NULL,
+    color = "Model",
+    title = "Hierarchical Student-t"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+
+## Model comparison
+
+
+```{r}
+
+
+(loo_normal <- loo(extract_log_lik(sepN_SA)))
+(loo_t      <- loo(extract_log_lik(sepT_SA)))
+(loo_hier  <- loo(extract_log_lik(hierT_SA)))
+
+loo_compare(loo_normal, loo_t, loo_hier)
+```
+
+
+# Software comparison: brms
+
+
+```{r}
+library(brms)
+
+
+brm_hierT <- brm(
+  bill_length ~ bill_depth + sex + (1 + bill_depth + sex | species),
+  data   = data,
+  family = student(),
+  chains = 4, iter = 10000, warmup = 5000,
+  control = list(adapt_delta = 0.95),
+  seed=984232
+)
+```
+
